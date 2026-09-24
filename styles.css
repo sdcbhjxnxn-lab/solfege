@@ -290,6 +290,19 @@ code, pre { font-family: var(--mono); }
 .quiz-visual:empty { display: none; }
 .quiz-playrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .btn-play { min-width: 108px; }
+
+/* 视唱页·节拍器运行指示（每拍点亮一个点，首拍加粗）
+   未点亮的点必须仍有足够对比度——面板底色很深，若用 --panel-3 当底色会几乎看不见，
+   用户会误以为「拍点数不对」。故未点亮态用中性灰 + 透明度，点亮态用主色。 */
+.metro-beats { display: inline-flex; align-items: center; gap: 5px; min-height: 14px; }
+.beat-dot {
+  display: block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-mute); opacity: .42;
+  transition: background .09s linear, opacity .09s linear, transform .09s linear;
+}
+.beat-dot.accent { width: 8px; height: 8px; }
+.beat-dot.on { background: var(--primary); opacity: 1; transform: scale(1.3); }
+.beat-dot.accent.on { background: var(--primary-hi); }
 .quiz-playbar { flex: 1 1 160px; min-width: 120px; }
 .quiz-bar { height: 5px; border-radius: 3px; background: var(--panel-3); overflow: hidden; }
 .quiz-bar-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--primary), var(--primary-hi)); border-radius: 3px; }

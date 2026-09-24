@@ -30,11 +30,17 @@ class FakeNode {
   stop() { }
   getFloatTimeDomainData(buf) { for (let i = 0; i < buf.length; i++) buf[i] = 0; }
 }
+// currentTime 必须走真实时间轴：节拍器是「循环调度 + 预排窗口」，时钟一旦冻结，
+// 它永远只排得出第一拍，任何关于「是否仍在打拍 / 是否已停止」的断言都会退化成
+// 永远通过的空断言（本项目已踩过这个坑，见 QA 报告中「断言有效性反向验证」）。
+const fakeClockT0 = Date.now();
 class FakeAudioContext {
   constructor() {
-    this.currentTime = 0; this.state = 'running'; this.sampleRate = 48000;
+    this.state = 'running'; this.sampleRate = 48000;
     this.destination = new FakeNode(this, 'destination');
   }
+  get currentTime() { return (Date.now() - fakeClockT0) / 1000; }
+  set currentTime(_v) { /* 只读时钟：忽略外部赋值 */ }
   createGain() { return new FakeNode(this, 'gain'); }
   createOscillator() { return new FakeNode(this, 'osc'); }
   createBiquadFilter() { return new FakeNode(this, 'biquad'); }
@@ -416,6 +422,122 @@ JSDOM.fromFile(indexFile, {
     await tick(80);
     ok(!!doc.querySelector('#view .tuner-display'), '音准仪页缺少显示区');
   }
+
+  section('视唱：速度即时生效、节拍器可开始/暂停、离场不残留');
+  // 重新挂载到「谱例视唱」（上面最后停在音准仪标签，且 hash 已是 #sight，
+  // 同 hash 不会触发重渲染，必须借道 #home 强制重挂）
+  win.location.hash = '#home';
+  await tick(60);
+  win.location.hash = '#sight';
+  await tick(100);
+
+  // 记录真实排入音频引擎的点击音 / 音序，用于观测「有没有发声、以什么速度发声」
+  const clicks = [];
+  const seqs = [];
+  const origClick = WB.Audio.playClick;
+  const origSeq = WB.Audio.playSequence;
+  WB.Audio.playClick = function (when, accent) {
+    clicks.push({ when: when, accent: !!accent });
+    return origClick.apply(WB.Audio, arguments);
+  };
+  WB.Audio.playSequence = function (ev) {
+    seqs.push(ev.map((e) => ({ at: e.at, midis: e.midis })));
+    return origSeq.apply(WB.Audio, arguments);
+  };
+
+  const pickPill = (label, value) => {
+    const groups = Array.from(doc.querySelectorAll('#view .panel-ctrl .ctrl-group'));
+    const g = groups.find((x) => ((x.querySelector('.ctrl-label') || {}).textContent || '').trim() === label);
+    if (!g) return false;
+    const b = Array.from(g.querySelectorAll('.pill')).find((x) => x.textContent.trim() === value);
+    if (b) b.click();
+    return !!b;
+  };
+  // 控件每次切换都会整块重建，故按钮引用必须每次重新查询，不能用旧引用
+  const actionBtn = (text) => Array.from(doc.querySelectorAll('#view .panel-ctrl .ctrl-bar .btn'))
+    .find((b) => b.textContent.trim() === text);
+  const dotCount = () => doc.querySelectorAll('#view .metro-beats .beat-dot').length;
+
+  // —— 1) 速度改变必须立刻影响播放时间轴，且不得重新生成音符 ——
+  // 缺陷版：速度 pill 只写 cfg.bpm，未同步到已生成的 mel.bpm，而播放读的是 mel.bpm，
+  // 于是改速度对播放完全没有影响（时间轴比值恒为 1.0）。
+  // 注意：本段所有「取第 0 个元素 / 取下标」都必须先判空。否则一旦前置断言失败，
+  // 后续解引用会抛 TypeError 把整个套件打断，反而看不到真正的失败清单。
+  ok(pickPill('速度', '80 BPM'), '未找到「80 BPM」速度按钮');
+  const playAll1 = actionBtn('播放全曲');
+  ok(!!playAll1, '未找到「播放全曲」按钮');
+  if (playAll1) playAll1.click();
+  await tick(40);
+  eq(seqs.length, 1, '「播放全曲」未触发音序播放');
+  const at80 = seqs[0] ? seqs[0].map((e) => e.at) : [];
+  const midis80 = JSON.stringify(seqs[0] ? seqs[0].map((e) => e.midis) : null);
+
+  ok(pickPill('速度', '100 BPM'), '未找到「100 BPM」速度按钮');
+  const playAll2 = actionBtn('播放全曲');
+  ok(!!playAll2, '改速度后未找到「播放全曲」按钮');
+  if (playAll2) playAll2.click();
+  await tick(40);
+  eq(seqs.length, 2, '改速度后「播放全曲」未再次触发音序播放');
+  const at100 = seqs[1] ? seqs[1].map((e) => e.at) : [];
+  eq(JSON.stringify(seqs[1] ? seqs[1].map((e) => e.midis) : null), midis80, '改速度不应重新生成音符');
+  ok(at80.length > 0 && at100.length === at80.length,
+    '两次播放的音符数应一致，实际 ' + at80.length + ' / ' + at100.length);
+  if (at80.length && at100.length === at80.length) {
+    const tempoRatio = at100[at100.length - 1] / at80[at80.length - 1];
+    ok(Math.abs(tempoRatio - 0.8) < 0.02,
+      '改速度未即时生效：80→100 BPM 的时间轴比值应≈0.8，实际 ' + tempoRatio.toFixed(4));
+  }
+
+  // —— 2) 节拍器必须可开始、可暂停，并循环持续打拍 ——
+  ok(pickPill('拍号', '3/4'), '未找到「3/4」拍号按钮');
+  await tick(40);
+  eq(dotCount(), 3, '3/4 拍的拍点指示应为 3 个');
+
+  clicks.length = 0;
+  const mbStart = actionBtn('节拍器');
+  ok(!!mbStart, '未找到「节拍器」按钮');
+  mbStart.click();
+  await tick(40);
+  const mbPlaying = actionBtn('暂停节拍器');
+  ok(!!mbPlaying, '节拍器开始后按钮应变为「暂停节拍器」');
+  ok(/btn-primary/.test((mbPlaying || {}).className || ''), '节拍器运行时应带运行态样式');
+  ok(clicks.length >= 1, '节拍器开始后未排出任何点击音，实际 ' + clicks.length);
+  ok(clicks.length >= 1 && clicks[0].accent === true, '节拍器第一拍应为重拍（accent）');
+  await tick(900);
+  ok(clicks.length >= 2, '节拍器应循环持续打拍，900ms 内点击音应 >= 2，实际 ' + clicks.length);
+
+  // 拍号改变时拍点指示必须跟随（节拍器的重拍分组也随之改变）
+  ok(pickPill('拍号', '4/4'), '未找到「4/4」拍号按钮');
+  await tick(40);
+  eq(dotCount(), 4, '拍号改为 4/4 后拍点数应为 4');
+
+  const mbPause = actionBtn('暂停节拍器');
+  ok(!!mbPause, '暂停时未找到「暂停节拍器」按钮');
+  if (mbPause) mbPause.click();
+  await tick(40);
+  ok(!!actionBtn('节拍器'), '再次点击后按钮应恢复为「节拍器」');
+  const afterPause = clicks.length;
+  await tick(500);
+  eq(clicks.length, afterPause, '节拍器暂停后不应再排出点击音');
+  eq(doc.querySelectorAll('#view .metro-beats .beat-dot.on').length, 0, '节拍器暂停后拍点指示应全部熄灭');
+
+  // —— 3) 离开视唱页后节拍器必须停止（定时器不得泄漏） ——
+  // 缺陷版若忘记在 destroy 中停表，setInterval 会继续按真实时钟排点击音——此处必须能抓到。
+  clicks.length = 0;
+  const mbAgain = actionBtn('节拍器');
+  ok(!!mbAgain, '离场测试前未找到「节拍器」按钮');
+  if (mbAgain) mbAgain.click();
+  await tick(900);
+  ok(clicks.length >= 2, '节拍器未进入循环打拍状态，实际 ' + clicks.length);
+  win.location.hash = '#home';
+  await tick(200);                      // 先让已排入预排窗口的最后一拍落地
+  const afterLeave = clicks.length;
+  await tick(800);
+  eq(clicks.length, afterLeave,
+    '离开视唱页后节拍器仍在打拍（定时器泄漏），离场后又响 ' + (clicks.length - afterLeave) + ' 次');
+
+  WB.Audio.playClick = origClick;
+  WB.Audio.playSequence = origSeq;
 
   section('统计与错题本');
   win.location.hash = '#stats';

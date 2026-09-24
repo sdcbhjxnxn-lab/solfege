@@ -105,14 +105,6 @@
     A.playSequence(ev);
     return mel.totalBeats * spb;
   }
-  function playMetronome(mel, seconds) {
-    var spb = 60 / mel.bpm;
-    var beatsPerBar = parseInt(mel.timeSig.split('/')[0], 10);
-    var t0 = A.currentTime() + 0.08;
-    var total = Math.max(seconds, mel.totalBeats * spb);
-    var n = Math.ceil(total / spb);
-    for (var i = 0; i < n; i++) A.playClick(t0 + i * spb, i % beatsPerBar === 0);
-  }
   function playReference(mel, kind) {
     A.stopAll();
     var key = mel.key;
@@ -252,6 +244,85 @@
           bars: barNotes, width: Math.max(420, dom.scoreStaff.clientWidth || 0)
         });
       }
+
+      /* ---- 节拍器：循环运行，可「开始 / 暂停」，实时跟随速度与拍号 ----
+         旧实现是一次性把整首的点击音排完（无状态、无法停止、也不随速度变化），
+         这里改为带状态的循环调度：用 350ms 预排窗口 + setInterval 补排，
+         既抗定时器抖动，又保证「停止」时最多只多响一拍。 */
+      var metro = { on: false, timer: null, next: 0, beat: 0, btn: null, dots: null };
+
+      function metroSpb() { return 60 / (cfg.bpm || 80); }
+      function metroPer() { return parseInt(String(cfg.timeSig).split('/')[0], 10) || 4; }
+
+      function metroPump() {
+        if (!metro.on) return;
+        var spb = metroSpb(), per = metroPer();
+        var horizon = A.currentTime() + 0.35;
+        while (metro.next < horizon) {
+          A.playClick(metro.next, metro.beat % per === 0);
+          (function (beat, at) {
+            setTimeout(function () { if (metro.on) paintBeat(beat); }, Math.max(0, (at - A.currentTime()) * 1000));
+          })(metro.beat, metro.next);
+          metro.next += spb;
+          metro.beat += 1;
+        }
+      }
+      function paintBeat(beat) {
+        if (!metro.dots) return;
+        var cur = beat % metroPer();
+        for (var i = 0; i < metro.dots.children.length; i++) {
+          metro.dots.children[i].className = 'beat-dot' + (i === 0 ? ' accent' : '') + (i === cur ? ' on' : '');
+        }
+      }
+      function clearBeat() {
+        if (!metro.dots) return;
+        for (var i = 0; i < metro.dots.children.length; i++) {
+          metro.dots.children[i].className = 'beat-dot' + (i === 0 ? ' accent' : '');
+        }
+      }
+      function buildBeatDots() {
+        if (!metro.dots) return;
+        U.clear(metro.dots);
+        for (var i = 0; i < metroPer(); i++) {
+          metro.dots.appendChild(U.el('i', { class: 'beat-dot' + (i === 0 ? ' accent' : '') }));
+        }
+      }
+      function syncMetroBtn() {
+        if (!metro.btn) return;
+        metro.btn.className = 'btn ' + (metro.on ? 'btn-primary' : 'btn-ghost');
+        metro.btn.setAttribute('aria-pressed', metro.on ? 'true' : 'false');
+        U.clear(metro.btn);
+        metro.btn.appendChild(U.el('span', { class: 'btn-icon', html: metro.on ? I.svgFilled('pause', 13) : I.svg('metronome', 16) }));
+        metro.btn.appendChild(U.el('span', { text: metro.on ? '\u6682\u505c\u8282\u62cd\u5668' : '\u8282\u62cd\u5668' }));
+      }
+      function metroStart() {
+        if (metro.on) return;
+        A.unlock();
+        metro.on = true;
+        metro.beat = 0;
+        metro.next = A.currentTime() + 0.12;
+        metroPump();
+        metro.timer = setInterval(metroPump, 60);
+        buildBeatDots();
+        syncMetroBtn();
+      }
+      /* silent=true 时不额外调用 stopAll（外层已统一静音时用） */
+      function metroStop(silent) {
+        var was = metro.on;
+        metro.on = false;
+        if (metro.timer) { clearInterval(metro.timer); metro.timer = null; }
+        if (!silent) A.stopAll();
+        if (was) { clearBeat(); syncMetroBtn(); }
+      }
+      function toggleMetro() { if (metro.on) metroStop(); else metroStart(); }
+      /* 速度属于「播放属性」而非「作曲属性」：改速度不重新生成音符，
+         但播放与节拍器都读 mel.bpm，必须同步；节拍器运行中则立即按新速度重排。 */
+      function setTempo(v) {
+        cfg.bpm = v;
+        if (state.mel) state.mel.bpm = v;
+        if (metro.on) { A.stopAll(); metro.next = A.currentTime() + 0.06; metro.beat = 0; }
+      }
+
       function rebuildControls() {
         U.clear(dom.scoreCtrl);
         function sel(label, values, current, onPick, fmt) {
@@ -272,27 +343,30 @@
           sel('\u96be\u5ea6', ['easy', 'medium', 'hard'], cfg.level, function (v) { cfg.level = v; regenerate(); }, function (v) {
             return { easy: '\u521d\u7ea7', medium: '\u4e2d\u7ea7', hard: '\u9ad8\u7ea7' }[v];
           }),
-          sel('\u901f\u5ea6', [60, 80, 100], cfg.bpm, function (v) { cfg.bpm = v; }, function (v) { return v + ' BPM'; })
+          sel('\u901f\u5ea6', [60, 80, 100], cfg.bpm, function (v) { setTempo(v); }, function (v) { return v + ' BPM'; })
         ]));
         dom.scoreCtrl.appendChild(U.el('div', { class: 'ctrl-bar' }, [
           U.el('button', { class: 'btn btn-ghost', type: 'button', on: { click: function () { regenerate(); } } }, '\u6362\u4e00\u6761'),
           U.el('button', {
             class: 'btn btn-ghost', type: 'button',
-            on: { click: function () { A.stopAll(); playReference(state.mel, 'triad'); } }
+            on: { click: function () { metroStop(); playReference(state.mel, 'triad'); } }
           }, '\u4e3b\u4e09\u548c\u5f26'),
           U.el('button', {
             class: 'btn btn-ghost', type: 'button',
-            on: { click: function () { A.stopAll(); playReference(state.mel, 'scale'); } }
+            on: { click: function () { metroStop(); playReference(state.mel, 'scale'); } }
           }, '\u8c03\u5185\u97f3\u9636'),
-          U.el('button', {
-            class: 'btn btn-ghost', type: 'button',
-            on: { click: function () { A.stopAll(); playMetronome(state.mel, state.mel.totalBeats * 60 / state.mel.bpm); } }
-          }, '\u8282\u62cd\u5668'),
+          (metro.btn = U.el('button', {
+            class: 'btn btn-ghost', type: 'button', title: '\u5f00\u59cb / \u6682\u505c\u8282\u62cd\u5668',
+            on: { click: function () { toggleMetro(); } }
+          }, '\u8282\u62cd\u5668')),
+          (metro.dots = U.el('span', { class: 'metro-beats' })),
           U.el('button', {
             class: 'btn btn-primary', type: 'button',
-            on: { click: function () { A.stopAll(); playMelody(state.mel); } }
+            on: { click: function () { metroStop(); playMelody(state.mel); } }
           }, [U.el('span', { class: 'btn-icon', html: I.svgFilled('play', 14) }), U.el('span', { text: '\u64ad\u653e\u5168\u66f2' })])
         ]));
+        buildBeatDots();
+        syncMetroBtn();
       }
 
       /* ---- 逐音模唱 ---- */
@@ -504,7 +578,7 @@
       renderInfo();
       renderMicPanel();
       return {
-        destroy: function () { stopMic(); }
+        destroy: function () { stopMic(); metroStop(); }
       };
     }
 
